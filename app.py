@@ -28,9 +28,31 @@ AWS_CONNECT_INSTANCE_ID = os.environ.get("AWS_CONNECT_INSTANCE_ID", "")
 
 # ── AWS Connect helpers ──────────────────────────────────────
 
+def get_all_routing_profile_ids(client):
+    """List all routing profile IDs for the instance."""
+    profile_ids = []
+    next_token = None
+    while True:
+        kwargs = {"InstanceId": AWS_CONNECT_INSTANCE_ID}
+        if next_token:
+            kwargs["NextToken"] = next_token
+        resp = client.list_routing_profiles(**kwargs)
+        for rp in resp.get("RoutingProfileSummaryList", []):
+            profile_ids.append(rp["Id"])
+        next_token = resp.get("NextToken")
+        if not next_token:
+            break
+    return profile_ids
+
+
 def poll_aws_connect():
     """Call AWS Connect get_current_user_data and return agent state list."""
     client = boto3.client("connect", region_name=AWS_REGION)
+
+    # API requires at least one filter — use all routing profiles to get all agents
+    routing_profile_ids = get_all_routing_profile_ids(client)
+    if not routing_profile_ids:
+        return []
 
     agents = []
     next_token = None
@@ -38,7 +60,7 @@ def poll_aws_connect():
     while True:
         kwargs = {
             "InstanceId": AWS_CONNECT_INSTANCE_ID,
-            "Filters": {},
+            "Filters": {"RoutingProfiles": routing_profile_ids},
         }
         if next_token:
             kwargs["NextToken"] = next_token

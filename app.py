@@ -38,7 +38,7 @@ def poll_aws_connect():
     while True:
         kwargs = {
             "InstanceId": AWS_CONNECT_INSTANCE_ID,
-            "Filters": {"Agents": []},
+            "Filters": {},
         }
         if next_token:
             kwargs["NextToken"] = next_token

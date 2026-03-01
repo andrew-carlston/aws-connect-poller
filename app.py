@@ -28,31 +28,56 @@ AWS_CONNECT_INSTANCE_ID = os.environ.get("AWS_CONNECT_INSTANCE_ID", "")
 
 # ── AWS Connect helpers ──────────────────────────────────────
 
-def get_all_routing_profile_ids(client):
-    """List all routing profile IDs for the instance."""
-    profile_ids = []
-    next_token = None
-    while True:
-        kwargs = {"InstanceId": AWS_CONNECT_INSTANCE_ID}
-        if next_token:
-            kwargs["NextToken"] = next_token
-        resp = client.list_routing_profiles(**kwargs)
-        for rp in resp.get("RoutingProfileSummaryList", []):
-            profile_ids.append(rp["Id"])
-        next_token = resp.get("NextToken")
-        if not next_token:
-            break
-    return profile_ids
+def get_filter_ids(client):
+    """Get filter IDs for get_current_user_data. Tries queues, then routing profiles."""
+    # Try listing queues first
+    try:
+        queue_ids = []
+        next_token = None
+        while True:
+            kwargs = {"InstanceId": AWS_CONNECT_INSTANCE_ID, "QueueTypes": ["STANDARD"]}
+            if next_token:
+                kwargs["NextToken"] = next_token
+            resp = client.list_queues(**kwargs)
+            for q in resp.get("QueueSummaryList", []):
+                queue_ids.append(q["Id"])
+            next_token = resp.get("NextToken")
+            if not next_token:
+                break
+        if queue_ids:
+            return {"Queues": queue_ids}
+    except Exception:
+        pass
+
+    # Try routing profiles
+    try:
+        rp_ids = []
+        next_token = None
+        while True:
+            kwargs = {"InstanceId": AWS_CONNECT_INSTANCE_ID}
+            if next_token:
+                kwargs["NextToken"] = next_token
+            resp = client.list_routing_profiles(**kwargs)
+            for rp in resp.get("RoutingProfileSummaryList", []):
+                rp_ids.append(rp["Id"])
+            next_token = resp.get("NextToken")
+            if not next_token:
+                break
+        if rp_ids:
+            return {"RoutingProfiles": rp_ids}
+    except Exception:
+        pass
+
+    return None
 
 
 def poll_aws_connect():
     """Call AWS Connect get_current_user_data and return agent state list."""
     client = boto3.client("connect", region_name=AWS_REGION)
 
-    # API requires at least one filter — use all routing profiles to get all agents
-    routing_profile_ids = get_all_routing_profile_ids(client)
-    if not routing_profile_ids:
-        return []
+    filters = get_filter_ids(client)
+    if not filters:
+        raise Exception("No permission to list queues or routing profiles — cannot filter get_current_user_data")
 
     agents = []
     next_token = None
@@ -60,7 +85,7 @@ def poll_aws_connect():
     while True:
         kwargs = {
             "InstanceId": AWS_CONNECT_INSTANCE_ID,
-            "Filters": {"RoutingProfiles": routing_profile_ids},
+            "Filters": filters,
         }
         if next_token:
             kwargs["NextToken"] = next_token

@@ -28,15 +28,17 @@ AWS_CONNECT_INSTANCE_ID = os.environ.get("AWS_CONNECT_INSTANCE_ID", "")
 
 # ── User mapping cache ────────────────────────────────────────
 _user_cache = {}
+_rp_cache = {}
 _user_cache_ts = None
 USER_CACHE_TTL = timedelta(minutes=10)
 
 
 def refresh_user_cache(client):
-    """Load all users from AWS Connect via list_users."""
-    global _user_cache, _user_cache_ts
+    """Load all users and routing profiles from AWS Connect."""
+    global _user_cache, _rp_cache, _user_cache_ts
 
-    mapping = {}
+    # Users
+    users = {}
     next_token = None
     while True:
         kwargs = {"InstanceId": AWS_CONNECT_INSTANCE_ID}
@@ -44,14 +46,32 @@ def refresh_user_cache(client):
             kwargs["NextToken"] = next_token
         resp = client.list_users(**kwargs)
         for u in resp.get("UserSummaryList", []):
-            mapping[u["Id"]] = {"email": u.get("Username", "")}
+            users[u["Id"]] = {"email": u.get("Username", "")}
         next_token = resp.get("NextToken")
         if not next_token:
             break
 
-    _user_cache = mapping
+    # Routing profiles
+    rps = {}
+    next_token = None
+    try:
+        while True:
+            kwargs = {"InstanceId": AWS_CONNECT_INSTANCE_ID}
+            if next_token:
+                kwargs["NextToken"] = next_token
+            resp = client.list_routing_profiles(**kwargs)
+            for rp in resp.get("RoutingProfileSummaryList", []):
+                rps[rp["Id"]] = rp.get("Name", "")
+            next_token = resp.get("NextToken")
+            if not next_token:
+                break
+    except Exception:
+        pass
+
+    _user_cache = users
+    _rp_cache = rps
     _user_cache_ts = datetime.now(timezone.utc)
-    return mapping
+    return users
 
 
 def get_user_mapping(client):
@@ -151,7 +171,7 @@ def poll_aws_connect(client=None):
                 "status_name": status.get("StatusName", ""),
                 "status_start_utc": status_start_iso,
                 "status_duration": status_duration,
-                "routing_profile": routing.get("Name", ""),
+                "routing_profile_id": routing.get("Id", ""),
                 "contacts": [
                     {
                         "id": c.get("ContactId", ""),
@@ -170,7 +190,7 @@ def poll_aws_connect(client=None):
     return agents
 
 
-def write_to_supabase(agents, snapshot_ts, user_mapping):
+def write_to_supabase(agents, snapshot_ts, user_mapping, rp_mapping):
     """Write agent snapshot rows to Supabase."""
     rows = []
     for a in agents:
@@ -183,7 +203,7 @@ def write_to_supabase(agents, snapshot_ts, user_mapping):
             "status_name": a["status_name"],
             "status_start_utc": a["status_start_utc"],
             "status_duration": a["status_duration"],
-            "routing_profile": a["routing_profile"],
+            "routing_profile": rp_mapping.get(a["routing_profile_id"], ""),
             "contacts": json.dumps(a["contacts"]) if a["contacts"] else None,
         })
 
@@ -253,11 +273,12 @@ def poll():
     try:
         client = boto3.client("connect", region_name=AWS_REGION)
         user_mapping = get_user_mapping(client)
+        rp_mapping = _rp_cache
         agents = poll_aws_connect(client)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-    count, err = write_to_supabase(agents, snapshot_ts, user_mapping)
+    count, err = write_to_supabase(agents, snapshot_ts, user_mapping, rp_mapping)
     if err:
         return jsonify({"ok": False, "error": err}), 500
 

@@ -215,6 +215,28 @@ def health():
     return jsonify({"status": "ok", "service": "aws-connect-poller"})
 
 
+@app.route("/debug")
+def debug():
+    """Return raw API response for one agent (for debugging)."""
+    token = request.args.get("token", "")
+    if POLL_SECRET and token != POLL_SECRET:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    client = boto3.client("connect", region_name=AWS_REGION)
+    filters = get_filter_ids(client)
+    resp = client.get_current_user_data(
+        InstanceId=AWS_CONNECT_INSTANCE_ID, Filters=filters, MaxResults=1
+    )
+    # Convert datetimes to strings for JSON
+    import copy
+    data = copy.deepcopy(resp.get("UserDataList", []))
+    for d in data:
+        for key in ("Status", ):
+            if key in d and "StatusStartTimestamp" in d[key]:
+                d[key]["StatusStartTimestamp"] = d[key]["StatusStartTimestamp"].isoformat()
+    return jsonify({"raw": data})
+
+
 @app.route("/poll")
 def poll():
     """Grab AWS Connect agent state snapshot and write to Supabase."""

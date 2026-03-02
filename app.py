@@ -33,10 +33,10 @@ USER_CACHE_TTL = timedelta(minutes=10)
 
 
 def refresh_user_cache(client):
-    """Load all users from AWS Connect via list_users + describe_user."""
+    """Load all users from AWS Connect via list_users."""
     global _user_cache, _user_cache_ts
 
-    users = {}
+    mapping = {}
     next_token = None
     while True:
         kwargs = {"InstanceId": AWS_CONNECT_INSTANCE_ID}
@@ -44,26 +44,10 @@ def refresh_user_cache(client):
             kwargs["NextToken"] = next_token
         resp = client.list_users(**kwargs)
         for u in resp.get("UserSummaryList", []):
-            users[u["Id"]] = u.get("Username", "")
+            mapping[u["Id"]] = {"email": u.get("Username", "")}
         next_token = resp.get("NextToken")
         if not next_token:
             break
-
-    # Describe each user to get first/last name
-    mapping = {}
-    for user_id, username in users.items():
-        try:
-            resp = client.describe_user(
-                InstanceId=AWS_CONNECT_INSTANCE_ID, UserId=user_id
-            )
-            info = resp.get("User", {}).get("IdentityInfo", {})
-            mapping[user_id] = {
-                "email": username,
-                "first_name": info.get("FirstName", ""),
-                "last_name": info.get("LastName", ""),
-            }
-        except Exception:
-            mapping[user_id] = {"email": username, "first_name": "", "last_name": ""}
 
     _user_cache = mapping
     _user_cache_ts = datetime.now(timezone.utc)
@@ -191,15 +175,11 @@ def write_to_supabase(agents, snapshot_ts, user_mapping):
     rows = []
     for a in agents:
         info = user_mapping.get(a["user_id"], {})
-        first = info.get("first_name", "")
-        last = info.get("last_name", "")
-        full_name = f"{first} {last}".strip() if first or last else ""
 
         rows.append({
             "snapshot_ts": snapshot_ts,
             "user_id": a["user_id"],
             "agent_email": info.get("email", ""),
-            "full_name": full_name,
             "status_name": a["status_name"],
             "status_start_utc": a["status_start_utc"],
             "status_duration": a["status_duration"],

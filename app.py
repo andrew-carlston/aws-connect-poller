@@ -26,6 +26,60 @@ AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 AWS_CONNECT_INSTANCE_ID = os.environ.get("AWS_CONNECT_INSTANCE_ID", "")
 
 
+# ── User mapping cache ────────────────────────────────────────
+_user_cache = {}
+_user_cache_ts = None
+USER_CACHE_TTL = timedelta(minutes=10)
+
+
+def refresh_user_cache(client):
+    """Load all users from AWS Connect via list_users + describe_user."""
+    global _user_cache, _user_cache_ts
+
+    users = {}
+    next_token = None
+    while True:
+        kwargs = {"InstanceId": AWS_CONNECT_INSTANCE_ID}
+        if next_token:
+            kwargs["NextToken"] = next_token
+        resp = client.list_users(**kwargs)
+        for u in resp.get("UserSummaryList", []):
+            users[u["Id"]] = u.get("Username", "")
+        next_token = resp.get("NextToken")
+        if not next_token:
+            break
+
+    # Describe each user to get first/last name
+    mapping = {}
+    for user_id, username in users.items():
+        try:
+            resp = client.describe_user(
+                InstanceId=AWS_CONNECT_INSTANCE_ID, UserId=user_id
+            )
+            info = resp.get("User", {}).get("IdentityInfo", {})
+            mapping[user_id] = {
+                "email": username,
+                "first_name": info.get("FirstName", ""),
+                "last_name": info.get("LastName", ""),
+            }
+        except Exception:
+            mapping[user_id] = {"email": username, "first_name": "", "last_name": ""}
+
+    _user_cache = mapping
+    _user_cache_ts = datetime.now(timezone.utc)
+    return mapping
+
+
+def get_user_mapping(client):
+    """Return cached user mapping, refreshing if stale."""
+    if (
+        _user_cache_ts is None
+        or datetime.now(timezone.utc) - _user_cache_ts > USER_CACHE_TTL
+    ):
+        refresh_user_cache(client)
+    return _user_cache
+
+
 # ── AWS Connect helpers ──────────────────────────────────────
 
 def get_filter_ids(client):
@@ -71,9 +125,10 @@ def get_filter_ids(client):
     return None
 
 
-def poll_aws_connect():
+def poll_aws_connect(client=None):
     """Call AWS Connect get_current_user_data and return agent state list."""
-    client = boto3.client("connect", region_name=AWS_REGION)
+    if client is None:
+        client = boto3.client("connect", region_name=AWS_REGION)
 
     filters = get_filter_ids(client)
     if not filters:
@@ -131,13 +186,20 @@ def poll_aws_connect():
     return agents
 
 
-def write_to_supabase(agents, snapshot_ts):
+def write_to_supabase(agents, snapshot_ts, user_mapping):
     """Write agent snapshot rows to Supabase."""
     rows = []
     for a in agents:
+        info = user_mapping.get(a["user_id"], {})
+        first = info.get("first_name", "")
+        last = info.get("last_name", "")
+        full_name = f"{first} {last}".strip() if first or last else ""
+
         rows.append({
             "snapshot_ts": snapshot_ts,
             "user_id": a["user_id"],
+            "agent_email": info.get("email", ""),
+            "full_name": full_name,
             "status_name": a["status_name"],
             "status_start_utc": a["status_start_utc"],
             "status_duration": a["status_duration"],
@@ -187,11 +249,13 @@ def poll():
     snapshot_ts = datetime.now(timezone.utc).isoformat()
 
     try:
-        agents = poll_aws_connect()
+        client = boto3.client("connect", region_name=AWS_REGION)
+        user_mapping = get_user_mapping(client)
+        agents = poll_aws_connect(client)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-    count, err = write_to_supabase(agents, snapshot_ts)
+    count, err = write_to_supabase(agents, snapshot_ts, user_mapping)
     if err:
         return jsonify({"ok": False, "error": err}), 500
 

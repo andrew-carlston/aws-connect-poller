@@ -20,8 +20,9 @@ app = Flask(__name__)
 
 # ── Config from environment ──────────────────────────────────
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")  # service role key
 POLL_SECRET = os.environ.get("POLL_SECRET", "")
+COMPANY_ID = os.environ.get("COMPANY_ID", "")  # tenant UUID
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 AWS_CONNECT_INSTANCE_ID = os.environ.get("AWS_CONNECT_INSTANCE_ID", "")
 
@@ -197,6 +198,7 @@ def write_to_supabase(agents, snapshot_ts, user_mapping, rp_mapping):
         info = user_mapping.get(a["user_id"], {})
 
         rows.append({
+            "company_id": COMPANY_ID,
             "snapshot_ts": snapshot_ts,
             "user_id": a["user_id"],
             "agent_email": info.get("email", ""),
@@ -267,6 +269,9 @@ def poll():
     if not AWS_CONNECT_INSTANCE_ID:
         return jsonify({"ok": False, "error": "AWS_CONNECT_INSTANCE_ID not configured"}), 500
 
+    if not COMPANY_ID:
+        return jsonify({"ok": False, "error": "COMPANY_ID not configured"}), 500
+
     start = time.time()
     snapshot_ts = datetime.now(timezone.utc).isoformat()
 
@@ -286,7 +291,7 @@ def poll():
     purged = 0
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
     del_resp = requests.delete(
-        f"{SUPABASE_URL}/rest/v1/aws_agent_snapshots?snapshot_ts=lt.{cutoff}",
+        f"{SUPABASE_URL}/rest/v1/aws_agent_snapshots?company_id=eq.{COMPANY_ID}&snapshot_ts=lt.{cutoff}",
         headers={
             "apikey": SUPABASE_KEY,
             "Authorization": f"Bearer {SUPABASE_KEY}",

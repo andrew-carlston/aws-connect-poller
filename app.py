@@ -175,14 +175,14 @@ def poll_aws_connect(client=None):
             contact_list = []
             for c in contacts:
                 connected_ts = c.get("ConnectedToAgentTimestamp")
-                acw_ts = c.get("AfterContactWorkStartTimestamp")
+                state_ts = c.get("StateStartTimestamp")
                 contact_list.append({
                     "id": c.get("ContactId", ""),
                     "channel": c.get("Channel", ""),
                     "state": c.get("AgentContactState", ""),
                     "queue": c.get("Queue", {}).get("Name", ""),
                     "connected_at": connected_ts.isoformat() if connected_ts else None,
-                    "acw_at": acw_ts.isoformat() if acw_ts else None,
+                    "state_start": state_ts.isoformat() if state_ts else None,
                 })
 
             # Determine effective status from contact states
@@ -200,30 +200,25 @@ def poll_aws_connect(client=None):
             else:
                 effective_status = raw_status
 
-            # Use contact timestamp for duration when on contact or ACW
+            # Use StateStartTimestamp for contact/ACW duration
             effective_start = status_start_iso
             effective_duration = status_duration
-            if has_connected:
+            if has_connected or has_acw:
                 for c in contact_list:
-                    if c["state"] in ("CONNECTED", "CONNECTED_ONHOLD") and c["connected_at"]:
-                        effective_start = c["connected_at"]
-                        ct = datetime.fromisoformat(c["connected_at"])
+                    if has_connected and c["state"] not in ("CONNECTED", "CONNECTED_ONHOLD"):
+                        continue
+                    if has_acw and c["state"] != "ENDED":
+                        continue
+                    # state_start = when this contact state began (most accurate)
+                    # connected_at = when call first connected (fallback for On Contact)
+                    ts = c.get("state_start") or (c.get("connected_at") if has_connected else None)
+                    if ts:
+                        effective_start = ts
+                        ct = datetime.fromisoformat(ts)
                         effective_duration = int(
                             (datetime.now(timezone.utc) - ct.replace(tzinfo=timezone.utc)).total_seconds()
                         )
-                        break
-            elif has_acw:
-                for c in contact_list:
-                    if c["state"] == "ENDED":
-                        # Use ACW start time if available, otherwise connected_at
-                        ts = c.get("acw_at") or c.get("connected_at")
-                        if ts:
-                            effective_start = ts
-                            ct = datetime.fromisoformat(ts)
-                            effective_duration = int(
-                                (datetime.now(timezone.utc) - ct.replace(tzinfo=timezone.utc)).total_seconds()
-                            )
-                        break
+                    break
 
             agents.append({
                 "user_id": user.get("Id", ""),

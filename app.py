@@ -2,6 +2,7 @@
 
 Polls AWS Connect API every 60 seconds for agent state snapshots.
 Writes each snapshot to Supabase for WFM interval analysis.
+Checks status thresholds and sends Slack notifications for breaches.
 
 Deployed on Render as a web service with a /poll endpoint
 triggered by an external cron (cron-job.org) or Render cron job.
@@ -10,11 +11,14 @@ triggered by an external cron (cron-job.org) or Render cron job.
 import os
 import json
 import time
+import logging
 from datetime import datetime, timezone, timedelta
 
 import boto3
 import requests
 from flask import Flask, jsonify, request
+
+log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -167,21 +171,46 @@ def poll_aws_connect(client=None):
                     (datetime.now(timezone.utc) - status_start.replace(tzinfo=timezone.utc)).total_seconds()
                 )
 
+            # Build contact list with connected timestamp
+            contact_list = []
+            for c in contacts:
+                connected_ts = c.get("ConnectedToAgentTimestamp")
+                contact_list.append({
+                    "id": c.get("ContactId", ""),
+                    "channel": c.get("Channel", ""),
+                    "state": c.get("AgentContactState", ""),
+                    "queue": c.get("Queue", {}).get("Name", ""),
+                    "connected_at": connected_ts.isoformat() if connected_ts else None,
+                })
+
+            # Determine effective status: if agent has CONNECTED contacts, they're "On Contact"
+            has_connected = any(
+                c["state"] in ("CONNECTED", "CONNECTED_ONHOLD")
+                for c in contact_list
+            )
+            effective_status = "On Contact" if has_connected else status.get("StatusName", "")
+
+            # For On Contact agents, use the contact connected time for duration
+            effective_start = status_start_iso
+            effective_duration = status_duration
+            if has_connected:
+                # Use the earliest connected contact's timestamp
+                for c in contact_list:
+                    if c["state"] in ("CONNECTED", "CONNECTED_ONHOLD") and c["connected_at"]:
+                        effective_start = c["connected_at"]
+                        ct = datetime.fromisoformat(c["connected_at"])
+                        effective_duration = int(
+                            (datetime.now(timezone.utc) - ct.replace(tzinfo=timezone.utc)).total_seconds()
+                        )
+                        break
+
             agents.append({
                 "user_id": user.get("Id", ""),
-                "status_name": status.get("StatusName", ""),
-                "status_start_utc": status_start_iso,
-                "status_duration": status_duration,
+                "status_name": effective_status,
+                "status_start_utc": effective_start,
+                "status_duration": effective_duration,
                 "routing_profile_id": routing.get("Id", ""),
-                "contacts": [
-                    {
-                        "id": c.get("ContactId", ""),
-                        "channel": c.get("Channel", ""),
-                        "state": c.get("AgentContactState", ""),
-                        "queue": c.get("Queue", {}).get("Name", ""),
-                    }
-                    for c in contacts
-                ],
+                "contacts": json.dumps(contact_list) if contact_list else None,
             })
 
         next_token = resp.get("NextToken")
@@ -206,7 +235,7 @@ def write_to_supabase(agents, snapshot_ts, user_mapping, rp_mapping):
             "status_start_utc": a["status_start_utc"],
             "status_duration": a["status_duration"],
             "routing_profile": rp_mapping.get(a["routing_profile_id"], ""),
-            "contacts": json.dumps(a["contacts"]) if a["contacts"] else None,
+            "contacts": a["contacts"],  # already JSON string or None
         })
 
     if not rows:
@@ -228,6 +257,278 @@ def write_to_supabase(agents, snapshot_ts, user_mapping, rp_mapping):
         return 0, f"Supabase error {resp.status_code}: {resp.text[:500]}"
 
     return len(rows), None
+
+
+# ── Threshold notifications + auto-infractions ──────────────
+
+def _sb_get(path, params=None):
+    """GET from Supabase REST API."""
+    resp = requests.get(
+        f"{SUPABASE_URL}/rest/v1/{path}",
+        headers={
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+        },
+        params=params or {},
+        timeout=15,
+    )
+    return resp.json() if resp.status_code == 200 else []
+
+
+def _sb_post(table, rows):
+    """POST rows to Supabase REST API."""
+    resp = requests.post(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers={
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+        },
+        json=rows,
+        timeout=15,
+    )
+    return resp.json() if resp.status_code in (200, 201) else None
+
+
+def _sb_patch(table, match, updates):
+    """PATCH rows matching filters."""
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    params = {f"{k}": f"eq.{v}" for k, v in match.items()}
+    requests.patch(
+        url,
+        headers={
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+        },
+        params=params,
+        json=updates,
+        timeout=15,
+    )
+
+
+def fetch_thresholds():
+    """Fetch status thresholds for this company."""
+    return _sb_get("status_thresholds", {
+        "company_id": f"eq.{COMPANY_ID}",
+        "select": "status_name,yellow_max_minutes,notification_delay_minutes",
+    })
+
+
+def fetch_directory_by_email():
+    """Fetch directory entries keyed by email."""
+    rows = _sb_get("directory", {
+        "company_id": f"eq.{COMPANY_ID}",
+        "active": "eq.true",
+        "select": "id,email,first_name,last_name,manager_id,slack_user_id",
+    })
+    return {r["email"].lower(): r for r in rows if r.get("email")}
+
+
+def fetch_slack_config():
+    """Fetch company Slack bot token."""
+    rows = _sb_get("company_settings", {
+        "company_id": f"eq.{COMPANY_ID}",
+        "select": "slack_bot_token",
+    })
+    return rows[0].get("slack_bot_token") if rows else None
+
+
+def fetch_active_notification(agent_identifier, status_name):
+    """Check for an active (not cleared) notification event."""
+    rows = _sb_get("notification_events", {
+        "company_id": f"eq.{COMPANY_ID}",
+        "agent_identifier": f"eq.{agent_identifier}",
+        "status_name": f"eq.{status_name}",
+        "cleared_at": "is.null",
+        "select": "id",
+    })
+    return rows[0] if rows else None
+
+
+def send_slack_dm(token, email, message, slack_user_id=None):
+    """Send a Slack DM to a user by email or slack_user_id."""
+    if not token:
+        return
+
+    user_id = slack_user_id
+    if not user_id and email:
+        try:
+            resp = requests.get(
+                "https://slack.com/api/users.lookupByEmail",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"email": email},
+                timeout=10,
+            )
+            data = resp.json()
+            if data.get("ok"):
+                user_id = data["user"]["id"]
+        except Exception:
+            pass
+
+    if not user_id:
+        return
+
+    try:
+        requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json={"channel": user_id, "text": message},
+            timeout=10,
+        )
+    except Exception as e:
+        log.warning(f"Slack DM failed: {e}")
+
+
+def fetch_infraction_type_for_status(status_name):
+    """Map a threshold breach status to an infraction type."""
+    status_lower = status_name.lower()
+    code = None
+    if "break" in status_lower or "lunch" in status_lower:
+        code = "BREAK_VIOLATION"
+    elif "not ready" in status_lower or "offline" in status_lower:
+        code = "TARDY"
+    else:
+        code = "TARDY"
+
+    rows = _sb_get("infraction_types", {
+        "company_id": f"eq.{COMPANY_ID}",
+        "code": f"eq.{code}",
+        "select": "id,default_points",
+    })
+    return rows[0] if rows else None
+
+
+def check_thresholds_and_notify(agents, user_mapping):
+    """After writing snapshots, check thresholds and send notifications."""
+    thresholds = fetch_thresholds()
+    if not thresholds:
+        return 0
+
+    threshold_map = {}
+    for t in thresholds:
+        threshold_map[t["status_name"].lower()] = {
+            "max_minutes": t["yellow_max_minutes"],
+            "delay_minutes": t.get("notification_delay_minutes", 5),
+        }
+
+    directory = fetch_directory_by_email()
+    slack_token = fetch_slack_config()
+    notified_count = 0
+    breaching_keys = set()
+
+    for agent in agents:
+        status = agent.get("status_name", "")
+        duration_sec = agent.get("status_duration")
+        if not status or duration_sec is None:
+            continue
+
+        threshold = threshold_map.get(status.lower())
+        if not threshold:
+            continue
+
+        notify_after_minutes = threshold["max_minutes"] + threshold["delay_minutes"]
+        duration_min = duration_sec / 60
+        agent_id = agent.get("user_id", "")
+        agent_email = user_mapping.get(agent_id, {}).get("email", "")
+
+        breach_key = f"{agent_id}:{status}"
+        breaching_keys.add(breach_key)
+
+        if duration_min < notify_after_minutes:
+            continue
+
+        # Over threshold+grace — check if already notified
+        existing = fetch_active_notification(agent_id, status)
+        if existing:
+            continue
+
+        # Create notification event
+        now_iso = datetime.now(timezone.utc).isoformat()
+        notif_row = _sb_post("notification_events", {
+            "company_id": COMPANY_ID,
+            "agent_identifier": agent_id,
+            "agent_email": agent_email,
+            "status_name": status,
+            "threshold_exceeded_at": now_iso,
+            "notified_at": now_iso,
+            "agent_notified": bool(slack_token),
+            "manager_notified": bool(slack_token),
+        })
+
+        notif_id = notif_row[0]["id"] if notif_row else None
+
+        # Send Slack DMs
+        dir_entry = directory.get(agent_email.lower(), {})
+        agent_name = f"{dir_entry.get('first_name', '')} {dir_entry.get('last_name', '')}".strip() or agent_email
+        threshold_min = threshold["max_minutes"]
+        dur_display = f"{int(duration_min)}m"
+
+        if slack_token:
+            send_slack_dm(
+                slack_token,
+                agent_email,
+                f"You've been in {status} for {dur_display}. Threshold is {threshold_min}m.",
+                dir_entry.get("slack_user_id"),
+            )
+
+            # DM manager
+            manager_id = dir_entry.get("manager_id")
+            if manager_id:
+                manager_rows = _sb_get("directory", {
+                    "id": f"eq.{manager_id}",
+                    "select": "email,slack_user_id",
+                })
+                if manager_rows:
+                    mgr = manager_rows[0]
+                    send_slack_dm(
+                        slack_token,
+                        mgr.get("email"),
+                        f"⚠️ {agent_name} has been in {status} for {dur_display} (threshold: {threshold_min}m)",
+                        mgr.get("slack_user_id"),
+                    )
+
+        # Auto-create infraction
+        person_id = dir_entry.get("id")
+        if person_id:
+            infraction_type = fetch_infraction_type_for_status(status)
+            if infraction_type:
+                _sb_post("infractions", {
+                    "company_id": COMPANY_ID,
+                    "person_id": person_id,
+                    "infraction_type_id": infraction_type["id"],
+                    "points": infraction_type["default_points"],
+                    "occurred_at": now_iso,
+                    "status_name": status,
+                    "breach_duration_seconds": duration_sec,
+                    "auto_detected": True,
+                    "notification_event_id": notif_id,
+                    "notes": f"Auto-detected: {status} for {dur_display} (threshold {threshold_min}m)",
+                })
+
+        notified_count += 1
+
+    # Clear notifications for agents no longer in breach
+    active_notifs = _sb_get("notification_events", {
+        "company_id": f"eq.{COMPANY_ID}",
+        "cleared_at": "is.null",
+        "select": "id,agent_identifier,status_name",
+    })
+
+    for notif in active_notifs:
+        key = f"{notif['agent_identifier']}:{notif['status_name']}"
+        if key not in breaching_keys:
+            _sb_patch(
+                "notification_events",
+                {"id": notif["id"]},
+                {"cleared_at": datetime.now(timezone.utc).isoformat()},
+            )
+
+    return notified_count
 
 
 # ── Flask endpoints ──────────────────────────────────────────
@@ -287,6 +588,13 @@ def poll():
     if err:
         return jsonify({"ok": False, "error": err}), 500
 
+    # Check thresholds and send notifications
+    notifications_sent = 0
+    try:
+        notifications_sent = check_thresholds_and_notify(agents, user_mapping)
+    except Exception as e:
+        log.warning(f"Notification check failed: {e}")
+
     # Purge snapshots older than 48 hours
     purged = 0
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
@@ -307,6 +615,7 @@ def poll():
         "ok": True,
         "agents_total": len(agents),
         "agents_written": count,
+        "notifications_sent": notifications_sent,
         "purged": purged,
         "snapshot_ts": snapshot_ts,
         "elapsed_sec": elapsed,

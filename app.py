@@ -171,30 +171,39 @@ def poll_aws_connect(client=None):
                     (datetime.now(timezone.utc) - status_start.replace(tzinfo=timezone.utc)).total_seconds()
                 )
 
-            # Build contact list with connected timestamp
+            # Build contact list with timestamps
             contact_list = []
             for c in contacts:
                 connected_ts = c.get("ConnectedToAgentTimestamp")
+                acw_ts = c.get("AfterContactWorkStartTimestamp")
                 contact_list.append({
                     "id": c.get("ContactId", ""),
                     "channel": c.get("Channel", ""),
                     "state": c.get("AgentContactState", ""),
                     "queue": c.get("Queue", {}).get("Name", ""),
                     "connected_at": connected_ts.isoformat() if connected_ts else None,
+                    "acw_at": acw_ts.isoformat() if acw_ts else None,
                 })
 
-            # Determine effective status: if agent has CONNECTED contacts, they're "On Contact"
+            # Determine effective status from contact states
             has_connected = any(
                 c["state"] in ("CONNECTED", "CONNECTED_ONHOLD")
                 for c in contact_list
             )
-            effective_status = "On Contact" if has_connected else status.get("StatusName", "")
+            has_acw = any(c["state"] == "ENDED" for c in contact_list)
 
-            # For On Contact agents, use the contact connected time for duration
+            raw_status = status.get("StatusName", "")
+            if has_connected:
+                effective_status = "On Contact"
+            elif has_acw:
+                effective_status = "After Contact Work"
+            else:
+                effective_status = raw_status
+
+            # Use contact timestamp for duration when on contact or ACW
             effective_start = status_start_iso
             effective_duration = status_duration
             if has_connected:
-                # Use the earliest connected contact's timestamp
                 for c in contact_list:
                     if c["state"] in ("CONNECTED", "CONNECTED_ONHOLD") and c["connected_at"]:
                         effective_start = c["connected_at"]
@@ -202,6 +211,18 @@ def poll_aws_connect(client=None):
                         effective_duration = int(
                             (datetime.now(timezone.utc) - ct.replace(tzinfo=timezone.utc)).total_seconds()
                         )
+                        break
+            elif has_acw:
+                for c in contact_list:
+                    if c["state"] == "ENDED":
+                        # Use ACW start time if available, otherwise connected_at
+                        ts = c.get("acw_at") or c.get("connected_at")
+                        if ts:
+                            effective_start = ts
+                            ct = datetime.fromisoformat(ts)
+                            effective_duration = int(
+                                (datetime.now(timezone.utc) - ct.replace(tzinfo=timezone.utc)).total_seconds()
+                            )
                         break
 
             agents.append({
